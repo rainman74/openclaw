@@ -120,6 +120,21 @@ export function acquireLinuxChildSubreaper() {
   if (childPids().length > 0) {
     throw new Error("Linux child ownership requires a dedicated owner without existing children");
   }
+  // Kernels without waitid __WALL (Linux < 4.7) report clone children they cannot
+  // observe as a typed "incomplete" error. That error is evidence of neither a
+  // surviving child nor an extinct tree; only ECHILD proves extinction.
+  const isIncomplete = (error: unknown): boolean =>
+    (error as { code?: string } | null)?.code === "incomplete";
+  const observeChild = (pid: number) => {
+    try {
+      return inspectChildWaitState(pid);
+    } catch (error) {
+      if (isIncomplete(error)) {
+        return undefined;
+      }
+      throw error;
+    }
+  };
   let closed = false;
   const owner = {
     retainSpawnedChild,
@@ -130,8 +145,8 @@ export function acquireLinuxChildSubreaper() {
       }
       for (const pid of childPids()) {
         // WNOWAIT retains wait ownership until the synchronous signal/reap completes.
-        const state = inspectChildWaitState(pid);
-        if (state.kind === "none") {
+        const state = observeChild(pid);
+        if (state === undefined || state.kind === "none") {
           continue;
         }
         const previousSignal = signaledChildren.get(pid);
@@ -156,7 +171,22 @@ export function acquireLinuxChildSubreaper() {
         }
       }
       // Only ECHILD proves extinction; running and retained exit statuses do not.
-      if (inspectChildWaitState().kind !== "none") {
+      // Without __WALL the aggregate observation cannot prove extinction, so an
+      // incomplete result blocks the drain until cleanup escalates to SIGKILL.
+      let aggregate: ReturnType<typeof inspectChildWaitState> | undefined;
+      try {
+        aggregate = inspectChildWaitState();
+      } catch (error) {
+        if (!isIncomplete(error)) {
+          throw error;
+        }
+        aggregate = undefined;
+      }
+      if (aggregate === undefined) {
+        if (signal !== "SIGKILL") {
+          return false;
+        }
+      } else if (aggregate.kind !== "none") {
         return false;
       }
       closed = true;
